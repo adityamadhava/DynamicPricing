@@ -1,0 +1,14 @@
+
+python3.12
+
+venv 
+
+
+pip install gymnasium numpy matplotlib Pillow torch scipy
+
+
+
+python feature_utils.py   # no main runner; used as library
+python lin_greedy.py
+python lin_ucb.py
+python policy_gradient.py
