@@ -21,5 +21,10 @@ python policy_gradient.py
 
 
 git add .
-git commit -m "message"
+git commit -m "env setup "
 git push origin main
+
+
+
+
+gource -fun animation
