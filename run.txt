@@ -12,3 +12,10 @@ python feature_utils.py   # no main runner; used as library
 python lin_greedy.py
 python lin_ucb.py
 python policy_gradient.py
+
+
+
+
+git add .
+git commit -m "message"
+git push origin main
