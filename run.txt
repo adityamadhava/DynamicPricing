@@ -19,6 +19,9 @@ python policy_gradient.py
 
 
 
+based on the test hypermaters , it will take approximately 2 hrs to run each
+
+so 6-7 hrs to run all the algos
 
 git add .
 git commit -m "env setup "
