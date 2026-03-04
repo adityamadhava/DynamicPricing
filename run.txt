@@ -1,14 +1,18 @@
+brew install python@3.12
 
-python3.12
+python3.12 --version
 
-venv 
+pip install --upgrade pip
 
+python3.12 -m venv .venv
+source .venv/bin/activate
+pip install -r requirements.txt
 
 pip install gymnasium numpy matplotlib Pillow torch scipy
 
 
 
-python feature_utils.py   # no main runner; used as library
+python feature_utils.py   # not main runner; used as library
 python lin_greedy.py
 python lin_ucb.py
 python policy_gradient.py
