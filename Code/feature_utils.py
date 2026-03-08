@@ -67,7 +67,7 @@ def compute_shortest_distance(map_img, x1, y1, x2, y2):
     return dist
 
 
-def extract_features(context, map_img, n_drivers=10, max_drivers=10):
+def extract_features(context, map_img, max_drivers=10):
     c_passenger, c_drivers = context
     c_passenger = np.asarray(c_passenger).ravel()
     x_orig, y_orig = float(c_passenger[0]), float(c_passenger[1])

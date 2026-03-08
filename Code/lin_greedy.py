@@ -6,7 +6,7 @@ import os
 import time
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from feature_utils import extract_features
+from Code.feature_utils import extract_features
 from RideSharing import DynamicPricingEnv
 
 np.random.seed(42)

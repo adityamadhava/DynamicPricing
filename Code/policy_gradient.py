@@ -4,15 +4,16 @@ from PIL import Image
 import sys
 import os
 import time
+import torch
+import torch.nn as nn
+TORCH_AVAILABLE = True
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from feature_utils import extract_features
 from RideSharing import DynamicPricingEnv
 
 np.random.seed(42)
 
 # Hyperparameters
-
 FEATURE_DIM = 7
 HORIZON = 720
 N_EPISODES = 200
@@ -22,37 +23,7 @@ BASELINE_DECAY = 0.99    # EMA decay for reward baseline
 WINDOW_SIZE = 2000
 MAX_DRIVERS = 10
 
-
-# Test Hyperparameters
-
-# FEATURE_DIM = 7
-# HORIZON = 720
-# N_EPISODES = 5
-# STD_FIXED = 0.1
-# LR = 0.001
-# BASELINE_DECAY = 0.99
-# WINDOW_SIZE = 100
-# MAX_DRIVERS = 10
-
-TOTAL_STEPS = N_EPISODES * HORIZON  # 144,000
-
-try:
-    import torch
-    import torch.nn as nn
-    TORCH_AVAILABLE = True
-except ImportError:
-    TORCH_AVAILABLE = False
-    print("PyTorch not found.")
-    sys.exit(1)
-
-
-def load_map():
-    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "map_agent.png")
-    img = Image.open(path)
-    arr = np.array(img)
-    if arr.ndim >= 3:
-        arr = arr[:, :, 0]
-    return arr.astype(np.float64) / 255.0
+TOTAL_STEPS = N_EPISODES * HORIZON
 
 
 def fmt_time(seconds):
@@ -66,8 +37,63 @@ def fmt_time(seconds):
     return f"{s}s"
 
 
+def extract_features_fast(obs, max_drivers=10):
 
-# Policy Network: 7 - 64 - 32 - 1 (sigmoid)
+    # Fast feature extraction using Euclidean distance instead of BFS.
+    # Avoids the 4-hour runtime caused by repeated BFS on the map image.
+    #
+    # Feature order:
+    #   [0] trip_dist          - Euclidean distance from passenger origin to destination
+    #   [1] min_driver_dist    - distance of closest driver to passenger
+    #   [2] mean_driver_dist   - mean distance of all drivers to passenger
+    #   [3] passenger_alpha    - passenger price sensitivity
+    #   [4] mean_driver_alpha  - mean driver price sensitivity
+    #   [5] min_driver_alpha   - min driver price sensitivity (most willing driver)
+    #   [6] num_drivers_norm   - number of nearby drivers / max_drivers
+
+    c_passenger, c_drivers = obs
+    c_passenger = np.asarray(c_passenger).ravel()
+
+    x_orig, y_orig = float(c_passenger[0]), float(c_passenger[1])
+    x_dest, y_dest = float(c_passenger[2]), float(c_passenger[3])
+    passenger_alpha = float(c_passenger[4])
+
+    # Euclidean trip distance
+    trip_dist = np.sqrt((x_dest - x_orig) ** 2 + (y_dest - y_orig) ** 2)
+
+    driver_dists = []
+    driver_alphas = []
+    if c_drivers is not None and len(c_drivers) > 0:
+        for d in c_drivers:
+            d = np.asarray(d).ravel()
+            if len(d) >= 3:
+                x_d, y_d, alpha_d = float(d[0]), float(d[1]), float(d[2])
+                dist = np.sqrt((x_d - x_orig) ** 2 + (y_d - y_orig) ** 2)
+                driver_dists.append(dist)
+                driver_alphas.append(alpha_d)
+
+    min_driver_dist   = float(np.min(driver_dists))   if driver_dists  else 0.0
+    mean_driver_dist  = float(np.mean(driver_dists))  if driver_dists  else 0.0
+    mean_driver_alpha = float(np.mean(driver_alphas)) if driver_alphas else 0.0
+    min_driver_alpha  = float(np.min(driver_alphas))  if driver_alphas else 0.0
+    num_drivers_norm  = len(driver_alphas) / max(max_drivers, 1)
+
+    passenger_alpha   = max(0.0, passenger_alpha)
+    mean_driver_alpha = max(0.0, mean_driver_alpha)
+    min_driver_alpha  = max(0.0, min_driver_alpha)
+
+    return np.array([
+        trip_dist,
+        min_driver_dist,
+        mean_driver_dist,
+        passenger_alpha,
+        mean_driver_alpha,
+        min_driver_alpha,
+        num_drivers_norm
+    ], dtype=np.float64)
+
+
+# Policy Network: 7 -> 64 -> 32 -> 1 (sigmoid)
 # Output is the mean price in [0, 1]
 
 class PolicyNet(nn.Module):
@@ -116,6 +142,9 @@ class PolicyGradientAgent:
         log_prob_normal = dist.log_prob(z).item()
 
         # Jacobian correction for sigmoid output layer
+        # Because output = sigmoid(pre_activation), we must account for the
+        # change-of-variables: log p(a) = log p(z) - log |d(sigmoid)/d(z)|
+        # d(sigmoid(z))/dz = sigmoid(z) * (1 - sigmoid(z)) = mu * (1 - mu)
         eps = 1e-6
         jacobian_log = float(np.log(mu_val * (1.0 - mu_val) + eps))
         log_prob_corrected = log_prob_normal - jacobian_log
@@ -142,19 +171,20 @@ class PolicyGradientAgent:
             + (1.0 - self.baseline_decay) * reward
         )
 
-        # Policy gradient loss (minimize negative expected reward)
+        # Policy gradient loss: minimize -(reward - baseline) * log_prob
         loss = -(reward - self.baseline) * log_prob_corrected
         self.optimizer.zero_grad()
         loss.backward()
         self.optimizer.step()
 
 
-def run_training(env, map_img, agent):
+def run_training(env, agent):
     all_rewards = []
     global_step = 0
     training_start = time.time()
     episode_times = []
-    print(f"Policy Gradient Training: {N_EPISODES} episodes × {HORIZON} steps = {TOTAL_STEPS:,} total steps")
+
+    print(f"Policy Gradient Training: {N_EPISODES} episodes x {HORIZON} steps = {TOTAL_STEPS:,} total steps")
     print(f"lr={LR}  std={STD_FIXED}  baseline_decay={BASELINE_DECAY}")
 
     for episode in range(N_EPISODES):
@@ -163,7 +193,7 @@ def run_training(env, map_img, agent):
         episode_reward = 0.0
 
         for t in range(HORIZON):
-            phi = extract_features(obs, map_img, max_drivers=MAX_DRIVERS)
+            phi = extract_features_fast(obs, max_drivers=MAX_DRIVERS)
             action, _ = agent.select_action(phi, explore=True)
             next_obs, reward, terminated, truncated, _ = env.step(float(action))
             agent.update_step(phi, action, float(reward))
@@ -183,17 +213,17 @@ def run_training(env, map_img, agent):
         pct = (episode + 1) / N_EPISODES * 100
 
         print(
-            f"[{episode+1:>3}/{N_EPISODES}] ({pct:5.1f}%)"
-            f"AvgRew: {avg_rew:+.5f}"
-            f"Baseline: {agent.baseline:.5f}"
-            f"EpTime: {ep_elapsed:.1f}s"
-            f"Elapsed: {fmt_time(total_elapsed)}"
+            f"[{episode+1:>3}/{N_EPISODES}] ({pct:5.1f}%)  "
+            f"AvgRew: {avg_rew:+.5f}  "
+            f"Baseline: {agent.baseline:.5f}  "
+            f"EpTime: {ep_elapsed:.1f}s  "
+            f"Elapsed: {fmt_time(total_elapsed)}  "
             f"ETA: {fmt_time(eta)}"
         )
 
         if (episode + 1) % 10 == 0:
             recent = all_rewards[-HORIZON * 10:]
-            print(f"Last 10 eps mean reward: {np.mean(recent):.5f}"
+            print(f"  Last 10 eps mean reward: {np.mean(recent):.5f}  "
                   f"std: {np.std(recent):.5f}  "
                   f"steps so far: {global_step:,}\n")
 
@@ -218,30 +248,35 @@ def run_training(env, map_img, agent):
     plt.savefig(out_path, dpi=150, bbox_inches="tight")
     plt.close()
     print(f"Saved reward curve to {out_path}")
+
     return all_rewards, window_avg
 
 
 def run_sanity_tests(env, agent):
+    """
+    Two sanity tests to verify the trained agent behaves logically.
 
-    # Feature order from feature_utils.py:
-    #   [0] trip_dist_norm
-    #   [1] alpha_p_norm        passenger price sensitivity
-    #   [2] n_drivers_norm
-    #   [3] mean_driver_dist
-    #   [4] min_driver_dist
-    #   [5] mean_alpha_d         driver price sensitivity
-    #   [6] road_density
+    Feature order:
+      [0] trip_dist          - Euclidean distance passenger origin -> destination
+      [1] min_driver_dist    - distance of closest driver to passenger
+      [2] mean_driver_dist   - mean distance of all drivers to passenger
+      [3] passenger_alpha    - passenger price sensitivity
+      [4] mean_driver_alpha  - mean driver price sensitivity
+      [5] min_driver_alpha   - min driver price sensitivity
+      [6] num_drivers_norm   - number of nearby drivers / max_drivers
+    """
 
     # Neutral baseline feature vector
-    base_phi = np.array([0.3, 0.5, 0.5, 0.2, 0.1, 0.5, 0.5], dtype=np.float32)
+    base_phi = np.array([0.3, 0.2, 0.3, 0.5, 0.5, 0.3, 0.5], dtype=np.float32)
 
-    # Test 1: Price vs Passenger Sensitivity (alpha_p = index 1)
-    # Expectation: higher passenger alpha -- agent should quote higher price
+    # Test 1: Price vs Passenger Sensitivity (passenger_alpha = index 3)
+    # Expectation: higher passenger alpha -> agent should quote higher price
+    # (passenger is more willing to pay, so app can charge more)
     alphas = np.linspace(0.05, 0.95, 15)
     prices_1 = []
     for alpha in alphas:
         phi = base_phi.copy()
-        phi[1] = alpha          # index 1 = passenger alpha
+        phi[3] = alpha          # index 3 = passenger_alpha
         prices_1.append(agent.get_mean(phi))
 
     plt.figure(figsize=(6, 4))
@@ -256,18 +291,19 @@ def run_sanity_tests(env, agent):
     print(f"Saved {out1}")
 
     # Test 2: Price vs Trip Distance (trip_dist = index 0)
-    # Expectation: longer trip --- higher price quoted
+    # Expectation: longer trip -> higher price quoted
+    # (longer trip = more commission earned)
     trip_distances = np.linspace(0.05, 0.9, 15)
     prices_2 = []
     for td in trip_distances:
         phi = base_phi.copy()
-        phi[0] = td             # index 0 = trip_dist_norm
+        phi[0] = td             # index 0 = trip_dist
         prices_2.append(agent.get_mean(phi))
 
     plt.figure(figsize=(6, 4))
     plt.plot(trip_distances, prices_2, "o-", color="coral")
     plt.title("Sanity Test 2: Price vs Trip Distance")
-    plt.xlabel("Trip distance (normalized)")
+    plt.xlabel("Trip distance (normalized Euclidean)")
     plt.ylabel("Quoted price (mean)")
     plt.grid(True)
     out2 = os.path.join(os.path.dirname(os.path.abspath(__file__)), "sanity_test_2.png")
@@ -277,18 +313,19 @@ def run_sanity_tests(env, agent):
 
 
 def main():
-    print("Loading map and environment...")
-    map_img = load_map()
+    print("Initializing environment...")
     env = DynamicPricingEnv()
     agent = PolicyGradientAgent(lr=LR, std=STD_FIXED, baseline_decay=BASELINE_DECAY)
+
     print("Starting Policy Gradient training...")
-    run_training(env, map_img, agent)
+    run_training(env, agent)
+
     print("\nRunning sanity tests...")
     run_sanity_tests(env, agent)
+
     print("Done!")
 
 
 if __name__ == "__main__":
     main()
-
 
